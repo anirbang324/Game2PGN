@@ -17,9 +17,39 @@ Date: 2026-02-04
 
 import os
 import sys
+import re
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
+
+try:
+    from PIL import Image, ImageEnhance
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("Warning: PIL/Pillow not available")
+
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("Warning: OpenCV not available")
+
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    print("Warning: pytesseract not available")
+
+try:
+    import chess
+    CHESS_AVAILABLE = True
+except ImportError:
+    CHESS_AVAILABLE = False
+    print("Warning: python-chess not available")
 
 
 class NotationType(Enum):
@@ -85,9 +115,20 @@ class ImagePreprocessor:
         if not os.path.exists(image_path):
             raise FileNotFoundError(f"Image not found: {image_path}")
         
-        # TODO: Implement image loading using PIL or OpenCV
         print(f"Loading image: {image_path}")
-        return None
+        
+        if CV2_AVAILABLE:
+            # Load with OpenCV (returns numpy array)
+            image = cv2.imread(image_path)
+            if image is None:
+                raise ValueError(f"Failed to load image: {image_path}")
+            return image
+        elif PIL_AVAILABLE:
+            # Load with PIL
+            image = Image.open(image_path)
+            return image
+        else:
+            raise RuntimeError("No image loading library available (install opencv-python or pillow)")
     
     def enhance_image(self, image):
         """
@@ -106,9 +147,33 @@ class ImagePreprocessor:
         Returns:
             Enhanced image object
         """
-        # TODO: Implement image enhancement
         print("Enhancing image for OCR...")
-        return image
+        
+        if not CV2_AVAILABLE:
+            print("  Skipping enhancement (OpenCV not available)")
+            return image
+        
+        # Convert to grayscale
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+        
+        # Apply denoising
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        
+        # Apply adaptive thresholding for better text extraction
+        binary = cv2.adaptiveThreshold(
+            denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Increase contrast
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(binary)
+        
+        print("  Applied: grayscale, denoising, thresholding, contrast enhancement")
+        return enhanced
     
     def detect_text_regions(self, image) -> List[Tuple[int, int, int, int]]:
         """
@@ -149,9 +214,36 @@ class OCREngine:
         Returns:
             Extracted text string
         """
-        # TODO: Implement OCR text extraction
         print("Extracting text from image...")
-        return ""
+        
+        if not TESSERACT_AVAILABLE:
+            print("  Warning: Tesseract not available, returning empty string")
+            return ""
+        
+        try:
+            # Extract region if specified
+            if region:
+                x, y, w, h = region
+                if CV2_AVAILABLE and isinstance(image, np.ndarray):
+                    image = image[y:y+h, x:x+w]
+                elif PIL_AVAILABLE:
+                    image = image.crop((x, y, x+w, y+h))
+            
+            # Configure Tesseract for better accuracy with chess notation
+            custom_config = r'--oem 3 --psm 6'
+            
+            # Extract text
+            if CV2_AVAILABLE and isinstance(image, np.ndarray):
+                text = pytesseract.image_to_string(image, config=custom_config)
+            else:
+                text = pytesseract.image_to_string(image, config=custom_config)
+            
+            print(f"  Extracted {len(text)} characters")
+            return text
+        
+        except Exception as e:
+            print(f"  Error during OCR: {e}")
+            return ""
     
     def get_confidence_scores(self, image) -> Dict[str, float]:
         """
@@ -163,8 +255,23 @@ class OCREngine:
         Returns:
             Dictionary mapping text to confidence scores
         """
-        # TODO: Implement confidence score extraction
-        return {}
+        if not TESSERACT_AVAILABLE:
+            return {}
+        
+        try:
+            # Get detailed OCR data with confidence scores
+            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+            
+            confidence_map = {}
+            for i, text in enumerate(data['text']):
+                if text.strip():
+                    conf = float(data['conf'][i]) / 100.0  # Convert to 0-1 range
+                    confidence_map[text] = conf
+            
+            return confidence_map
+        except Exception as e:
+            print(f"  Error getting confidence scores: {e}")
+            return {}
 
 
 class NotationParser:
@@ -190,8 +297,33 @@ class NotationParser:
             List of ChessMove objects
         """
         moves = []
-        # TODO: Implement notation parsing logic
         print(f"Parsing moves using {self.notation_type.value} notation...")
+        
+        # Pattern to match chess moves: move number, white move, optional black move
+        # Examples: "1. e4 e5", "2. Nf3 Nc6", "3. Bb5"
+        move_pattern = r'(\d+)\.\s*([A-Za-z0-9+#=\-x]+)(?:\s+([A-Za-z0-9+#=\-x]+))?'
+        
+        matches = re.findall(move_pattern, text)
+        
+        for match in matches:
+            move_num = int(match[0])
+            white_move = match[1].strip()
+            black_move = match[2].strip() if match[2] else None
+            
+            # Normalize moves
+            white_move = self.normalize_move(white_move)
+            if black_move:
+                black_move = self.normalize_move(black_move)
+            
+            chess_move = ChessMove(
+                move_number=move_num,
+                white_move=white_move,
+                black_move=black_move,
+                confidence=0.9  # Default confidence, can be updated with OCR scores
+            )
+            moves.append(chess_move)
+        
+        print(f"  Parsed {len(moves)} move pairs")
         return moves
     
     def validate_move(self, move: str, position: Optional[str] = None) -> bool:
@@ -205,8 +337,17 @@ class NotationParser:
         Returns:
             True if move is valid, False otherwise
         """
-        # TODO: Implement move validation using chess library
-        return True
+        if not CHESS_AVAILABLE:
+            # Can't validate without python-chess, assume valid
+            return True
+        
+        try:
+            board = chess.Board(position) if position else chess.Board()
+            # Try to parse the move in SAN (Standard Algebraic Notation)
+            board.parse_san(move)
+            return True
+        except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError):
+            return False
     
     def normalize_move(self, move: str) -> str:
         """
@@ -218,8 +359,23 @@ class NotationParser:
         Returns:
             Normalized move string
         """
-        # TODO: Implement move normalization
-        return move.strip()
+        # Remove extra whitespace
+        move = move.strip()
+        
+        # Remove common OCR errors
+        move = move.replace('O', '0')  # Sometimes O is misread as 0
+        move = move.replace('o', '0')
+        
+        # Handle castling notation
+        if move in ['0-0', '00', 'O-O']:
+            move = 'O-O'
+        elif move in ['0-0-0', '000', 'O-O-O']:
+            move = 'O-O-O'
+        
+        # Remove periods that might have been captured
+        move = move.replace('.', '')
+        
+        return move
 
 
 class UserVerificationInterface:
@@ -401,7 +557,7 @@ def main():
     converter = ChessNotationConverter(NotationType.ALGEBRAIC)
     
     # TODO: Replace with actual image path
-    image_path = "example_notation.jpg"
+    image_path = "notation.jpg"  # File is in the same directory as this script
     output_path = "output_game.pgn"
     
     # Create sample metadata
@@ -415,8 +571,8 @@ def main():
     )
     
     # Uncomment when ready to test with actual images
-    # pgn = converter.convert_image_to_pgn(image_path, output_path, metadata)
-    # print(f"\nGenerated PGN:\n{pgn}")
+    pgn = converter.convert_image_to_pgn(image_path, output_path, metadata)
+    print(f"\nGenerated PGN:\n{pgn}")
     
     print("Note: This is a framework. Implement TODO sections with:")
     print("  - PIL/Pillow or OpenCV for image processing")
