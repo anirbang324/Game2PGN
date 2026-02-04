@@ -557,7 +557,7 @@ def main():
     converter = ChessNotationConverter(NotationType.ALGEBRAIC)
     
     # TODO: Replace with actual image path
-    image_path = "notation.jpg"  # File is in the same directory as this script
+    image_path = "C:/Users/anirb/OneDrive/Documents/Game2PGN/Game2PGN/notation.jpg"  # File is in the same directory as this script
     output_path = "output_game.pgn"
     
     # Create sample metadata
