@@ -39,10 +39,27 @@ except ImportError:
 
 try:
     import pytesseract
+    import os as _os
+    # Auto-detect Tesseract executable on Windows if not already on PATH
+    _tess_candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for _p in _tess_candidates:
+        if _os.path.exists(_p):
+            pytesseract.pytesseract.tesseract_cmd = _p
+            break
     TESSERACT_AVAILABLE = True
 except ImportError:
     TESSERACT_AVAILABLE = False
     print("Warning: pytesseract not available")
+
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    print("Warning: easyocr not available")
 
 try:
     import chess
@@ -132,47 +149,48 @@ class ImagePreprocessor:
     
     def enhance_image(self, image):
         """
-        Apply preprocessing techniques to improve OCR accuracy
-        
-        Techniques include:
-        - Grayscale conversion
-        - Noise reduction
-        - Contrast enhancement
-        - Binarization (thresholding)
-        - Deskewing (rotation correction)
-        
+        Apply gentle preprocessing for handwritten chess notation.
+
+        Uses grayscale + mild contrast + 2x upscaling for small handwriting.
+        No binarization — that destroys handwriting curves for EasyOCR.
+
         Args:
-            image: Input image object
-            
+            image: Input image (numpy ndarray from OpenCV)
+
         Returns:
-            Enhanced image object
+            Enhanced image (BGR ndarray, upscaled 2x)
         """
         print("Enhancing image for OCR...")
-        
+
         if not CV2_AVAILABLE:
             print("  Skipping enhancement (OpenCV not available)")
             return image
-        
+
+        # Upscale 2x — improves EasyOCR accuracy on small handwriting
+        h, w = image.shape[:2]
+        image = cv2.resize(image, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
         # Convert to grayscale
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
-        
-        # Apply denoising
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-        
-        # Apply adaptive thresholding for better text extraction
-        binary = cv2.adaptiveThreshold(
-            denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
-        
-        # Increase contrast
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(binary)
-        
-        print("  Applied: grayscale, denoising, thresholding, contrast enhancement")
+
+        # Mild CLAHE to improve local contrast without destroying ink strokes
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # Mild sharpening kernel
+        kernel = np.array([[0, -0.5, 0],
+                           [-0.5, 3, -0.5],
+                           [0, -0.5, 0]])
+        enhanced = cv2.filter2D(enhanced, -1, kernel)
+        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+
+        # Convert back to BGR so EasyOCR receives a 3-channel image
+        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+        print(f"  Applied: 2x upscale, grayscale, CLAHE, sharpen -> {enhanced.shape[1]}x{enhanced.shape[0]}")
         return enhanced
     
     def detect_text_regions(self, image) -> List[Tuple[int, int, int, int]]:
@@ -191,87 +209,303 @@ class ImagePreprocessor:
 
 
 class OCREngine:
-    """Handles optical character recognition of chess notation"""
-    
-    def __init__(self, engine: str = "tesseract"):
+    """
+    Handles optical character recognition of chess notation.
+
+    Uses EasyOCR as the primary engine (no external binary required).
+    Falls back to Tesseract if EasyOCR is unavailable.
+    """
+
+    def __init__(self, engine: str = "auto"):
         """
-        Initialize the OCR engine
-        
+        Initialize the OCR engine.
+
         Args:
-            engine: OCR engine to use ('tesseract', 'easyocr', etc.)
+            engine: 'easyocr' | 'tesseract' | 'auto' (tries EasyOCR first, then Tesseract)
         """
-        self.engine = engine
-        print(f"Initializing OCR engine: {engine}")
-    
+        self._easyocr_reader = None
+
+        if engine == "auto":
+            if EASYOCR_AVAILABLE:
+                self.engine = "easyocr"
+            elif TESSERACT_AVAILABLE:
+                self.engine = "tesseract"
+            else:
+                self.engine = "none"
+        else:
+            self.engine = engine
+
+        print(f"Initializing OCR engine: {self.engine}")
+
+        if self.engine == "easyocr":
+            print("  Loading EasyOCR model (first run may download ~100 MB)...")
+            self._easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            print("  EasyOCR ready.")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def extract_text(self, image, region: Optional[Tuple[int, int, int, int]] = None) -> str:
         """
-        Extract text from an image or image region
-        
+        Extract text from an image or image region.
+
         Args:
-            image: Input image object
-            region: Optional bounding box (x, y, width, height) to extract from
-            
+            image: Input image (numpy ndarray or PIL Image)
+            region: Optional bounding box (x, y, width, height)
+
         Returns:
             Extracted text string
         """
         print("Extracting text from image...")
-        
-        if not TESSERACT_AVAILABLE:
-            print("  Warning: Tesseract not available, returning empty string")
+
+        if region and CV2_AVAILABLE and isinstance(image, np.ndarray):
+            x, y, w, h = region
+            image = image[y:y + h, x:x + w]
+        elif region and PIL_AVAILABLE:
+            x, y, w, h = region
+            image = image.crop((x, y, x + w, y + h))
+
+        if self.engine == "easyocr":
+            return self._extract_easyocr(image)
+        elif self.engine == "tesseract":
+            return self._extract_tesseract(image)
+        else:
+            print("  ERROR: No OCR engine available.")
+            print("  Install EasyOCR:  pip install easyocr")
+            print("  Install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki")
             return ""
-        
-        try:
-            # Extract region if specified
-            if region:
-                x, y, w, h = region
-                if CV2_AVAILABLE and isinstance(image, np.ndarray):
-                    image = image[y:y+h, x:x+w]
-                elif PIL_AVAILABLE:
-                    image = image.crop((x, y, x+w, y+h))
-            
-            # Configure Tesseract for better accuracy with chess notation
-            custom_config = r'--oem 3 --psm 6'
-            
-            # Extract text
-            if CV2_AVAILABLE and isinstance(image, np.ndarray):
-                text = pytesseract.image_to_string(image, config=custom_config)
-            else:
-                text = pytesseract.image_to_string(image, config=custom_config)
-            
-            print(f"  Extracted {len(text)} characters")
-            return text
-        
-        except Exception as e:
-            print(f"  Error during OCR: {e}")
-            return ""
-    
+
     def get_confidence_scores(self, image) -> Dict[str, float]:
+        """Return per-word confidence scores (EasyOCR only for now)."""
+        if self.engine == "easyocr" and self._easyocr_reader is not None:
+            try:
+                results = self._easyocr_reader.readtext(image)
+                return {text: float(conf) for (_, text, conf) in results}
+            except Exception as e:
+                print(f"  Error getting confidence scores: {e}")
+        elif self.engine == "tesseract" and TESSERACT_AVAILABLE:
+            try:
+                data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+                return {
+                    text: float(data['conf'][i]) / 100.0
+                    for i, text in enumerate(data['text'])
+                    if text.strip()
+                }
+            except Exception as e:
+                print(f"  Error getting confidence scores: {e}")
+        return {}
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _get_all_ocr_results(self, image, n_strips: int = 4) -> list:
         """
-        Get confidence scores for extracted text
-        
-        Args:
-            image: Input image object
-            
-        Returns:
-            Dictionary mapping text to confidence scores
+        Run EasyOCR on N horizontal strips and merge results with Y-offset.
+
+        Processing in strips prevents EasyOCR from missing rows in tall images.
+        Uses paragraph=False to detect individual words (better for scoresheet cells).
         """
+        h, w = image.shape[:2]
+        strip_height = h // n_strips
+        overlap = strip_height // 4
+
+        all_results = []
+        seen_positions = set()
+
+        for i in range(n_strips):
+            y_start = max(0, i * strip_height - overlap)
+            y_end   = min(h, y_start + strip_height + overlap)
+            strip   = image[y_start:y_end, :]
+
+            try:
+                # paragraph=False: detect individual words/tokens
+                # width_ths=0.3: allow narrow bounding boxes (single letters)
+                strip_results = self._easyocr_reader.readtext(
+                    strip,
+                    paragraph=False,
+                    width_ths=0.3,
+                    x_ths=0.5,
+                )
+            except Exception as e:
+                print(f"  EasyOCR strip {i+1} error: {e}")
+                continue
+
+            for (bbox, text, conf) in strip_results:
+                if not text.strip():
+                    continue
+                global_bbox = [[pt[0], pt[1] + y_start] for pt in bbox]
+
+                ys = [pt[1] for pt in global_bbox]
+                xs = [pt[0] for pt in global_bbox]
+                x_c = (min(xs) + max(xs)) / 2
+                y_c = (min(ys) + max(ys)) / 2
+                key = (round(x_c / 30) * 30,
+                       round(y_c / 25) * 25,
+                       text.strip()[:10])
+                if key in seen_positions:
+                    continue
+                seen_positions.add(key)
+                all_results.append((global_bbox, text, conf))
+
+        # Sort by Y then X and print all tokens for diagnostics
+        all_results.sort(key=lambda r: (
+            (min(pt[1] for pt in r[0]) + max(pt[1] for pt in r[0])) / 2,
+            (min(pt[0] for pt in r[0]) + max(pt[0] for pt in r[0])) / 2,
+        ))
+        print(f"  Strip OCR: {n_strips} strips -> {len(all_results)} total tokens")
+        print("  All tokens (X_centre, Y_centre, text, conf):")
+        for (bbox, text, conf) in all_results:
+            xs = [pt[0] for pt in bbox]; ys = [pt[1] for pt in bbox]
+            print(f"    x={int((min(xs)+max(xs))/2):4d} y={int((min(ys)+max(ys))/2):4d}"
+                  f"  '{text}'  ({conf:.2f})")
+        return all_results
+
+    def _extract_easyocr(self, image) -> str:
+        """
+        Extract text using EasyOCR with strip processing and column-aware parsing.
+
+        Strategy:
+        1. Process image in horizontal strips to capture all rows.
+        2. Detect #/WHITE/BLACK column X-boundaries from header row.
+        3. Classify each token to its column by X-centre.
+        4. Reconstruct lines as "N. white black" for the parser.
+        """
+        results = self._get_all_ocr_results(image, n_strips=4)
+
+        if not results:
+            print("  EasyOCR returned no results.")
+            return ""
+
+        # ----------------------------------------------------------------
+        # Build token list:  (y_c, x_c, text, conf)
+        # ----------------------------------------------------------------
+        tokens = []
+        for (bbox, text, conf) in results:
+            if conf < 0.05 or not text.strip():
+                continue
+            xs = [pt[0] for pt in bbox]
+            ys = [pt[1] for pt in bbox]
+            x_c = (min(xs) + max(xs)) / 2
+            y_c = (min(ys) + max(ys)) / 2
+            tokens.append((y_c, x_c, text.strip(), conf))
+
+        if not tokens:
+            return ""
+
+        tokens.sort(key=lambda t: t[0])   # sort by Y
+
+        img_width  = image.shape[1] if hasattr(image, 'shape') else 1000
+
+        # ----------------------------------------------------------------
+        # Step 1: Detect column X-boundaries from header row
+        # ----------------------------------------------------------------
+        num_x_mid   = img_width * 0.06
+        white_x_mid = img_width * 0.38
+        black_x_mid = img_width * 0.72
+
+        for tok in tokens[:30]:   # header is near the top
+            txt_lower = tok[2].lower().strip('#').strip()
+            if txt_lower == 'white':
+                white_x_mid = tok[1]
+            elif txt_lower == 'black':
+                black_x_mid = tok[1]
+            elif txt_lower == '#':
+                num_x_mid = tok[1]
+
+        num_white_boundary   = (num_x_mid + white_x_mid) / 2
+        white_black_boundary = (white_x_mid + black_x_mid) / 2
+
+        print(f"  Column X-boundaries: #<{num_white_boundary:.0f} | "
+              f"WHITE<{white_black_boundary:.0f} | BLACK>")
+
+        # ----------------------------------------------------------------
+        # Step 2: Cluster tokens into rows by Y centroid
+        # ----------------------------------------------------------------
+        heights = []
+        for (_, _, text, conf) in tokens:
+            pass   # use global median
+        # Estimate row height from consecutive Y gaps
+        ys_sorted = sorted(t[0] for t in tokens)
+        gaps = [ys_sorted[i+1] - ys_sorted[i]
+                for i in range(len(ys_sorted)-1)
+                if ys_sorted[i+1] - ys_sorted[i] > 2]
+        if gaps:
+            gaps.sort()
+            typical_gap = gaps[len(gaps)//2]
+        else:
+            typical_gap = 20
+        row_tol = max(10, typical_gap * 0.6)
+
+        rows: List[List[tuple]] = []
+        current_row: List[tuple] = [tokens[0]]
+        for tok in tokens[1:]:
+            if abs(tok[0] - current_row[-1][0]) <= row_tol:
+                current_row.append(tok)
+            else:
+                rows.append(sorted(current_row, key=lambda t: t[1]))
+                current_row = [tok]
+        rows.append(sorted(current_row, key=lambda t: t[1]))
+
+        # ----------------------------------------------------------------
+        # Step 3: Assign each token to a column and build "N. w b" lines
+        # ----------------------------------------------------------------
+        header_noise = {'event','round','board','section','opening','control',
+                        'time','ttme','white','black','result','draw','#',
+                        'rating','ratng','ratins','ratin','signature','won',
+                        'abhyuday','mitas','abhyudoy','abhyudey',
+                        'draw','signature','isection','opening'}
+
+        line_strings = []
+        for row in rows:
+            all_text = " ".join(t[2] for t in row).lower()
+            if any(kw in all_text for kw in header_noise):
+                continue
+
+            num_tok, white_tok, black_tok = [], [], []
+            for tok in row:
+                x_c = tok[1]
+                txt = tok[2]
+                if x_c < num_white_boundary:
+                    num_tok.append(txt)
+                elif x_c < white_black_boundary:
+                    white_tok.append(txt)
+                else:
+                    black_tok.append(txt)
+
+            num_str   = " ".join(num_tok).strip().strip('.,;:')
+            white_str = " ".join(white_tok).strip()
+            black_str = " ".join(black_tok).strip()
+
+            if num_str.isdigit():
+                parts = [f"{num_str}."]
+                if white_str:
+                    parts.append(white_str)
+                if black_str:
+                    parts.append(black_str)
+                line_strings.append(" ".join(parts))
+
+        text = "\n".join(line_strings)
+        print(f"  Column-aware extraction: {len(line_strings)} move rows")
+        print(f"  Reconstructed notation:\n{text}")
+        return text
+
+
+
+    def _extract_tesseract(self, image) -> str:
+        """Extract text using Tesseract (requires tesseract executable)."""
         if not TESSERACT_AVAILABLE:
-            return {}
-        
+            print("  Tesseract Python package not available.")
+            return ""
         try:
-            # Get detailed OCR data with confidence scores
-            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-            
-            confidence_map = {}
-            for i, text in enumerate(data['text']):
-                if text.strip():
-                    conf = float(data['conf'][i]) / 100.0  # Convert to 0-1 range
-                    confidence_map[text] = conf
-            
-            return confidence_map
+            custom_config = r'--oem 3 --psm 6'
+            text = pytesseract.image_to_string(image, config=custom_config)
+            print(f"  Tesseract extracted {len(text)} characters")
+            return text
         except Exception as e:
-            print(f"  Error getting confidence scores: {e}")
-            return {}
+            print(f"  Tesseract error: {e}")
+            return ""
 
 
 class NotationParser:
@@ -288,43 +522,124 @@ class NotationParser:
     
     def parse_moves(self, text: str) -> List[ChessMove]:
         """
-        Parse chess notation text into a list of moves
-        
+        Parse chess notation text into a list of moves.
+
+        Handles two input formats:
+        1. Standard PGN / linear text:   "1. e4 e5  2. Nf3 Nc6 ..."
+        2. Chess scoresheet rows:        "1 d4 d5"  or  "1 d4 d5 31 Qd2 Qe7"
+                                         (number without dot, 0-2 SAN tokens)
+
         Args:
-            text: Raw text containing chess moves
-            
+            text: Raw text (spatially reconstructed from OCR rows)
+
         Returns:
-            List of ChessMove objects
+            List of ChessMove objects, one per move number, sorted ascending.
         """
-        moves = []
         print(f"Parsing moves using {self.notation_type.value} notation...")
-        
-        # Pattern to match chess moves: move number, white move, optional black move
-        # Examples: "1. e4 e5", "2. Nf3 Nc6", "3. Bb5"
-        move_pattern = r'(\d+)\.\s*([A-Za-z0-9+#=\-x]+)(?:\s+([A-Za-z0-9+#=\-x]+))?'
-        
-        matches = re.findall(move_pattern, text)
-        
-        for match in matches:
-            move_num = int(match[0])
-            white_move = match[1].strip()
-            black_move = match[2].strip() if match[2] else None
-            
-            # Normalize moves
-            white_move = self.normalize_move(white_move)
-            if black_move:
-                black_move = self.normalize_move(black_move)
-            
-            chess_move = ChessMove(
-                move_number=move_num,
-                white_move=white_move,
-                black_move=black_move,
-                confidence=0.9  # Default confidence, can be updated with OCR scores
-            )
-            moves.append(chess_move)
-        
+
+        move_dict: Dict[int, ChessMove] = {}
+
+        # ----------------------------------------------------------------
+        # Regex helpers
+        # ----------------------------------------------------------------
+        san_token = r'(?:O-O-O|O-O|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)'
+        san_re    = re.compile(r'^' + san_token + r'$', re.IGNORECASE)
+        num_re    = re.compile(r'^\d{1,3}[.,]?$')   # bare number like "1", "31.", "9:"
+
+        # ----------------------------------------------------------------
+        # Pass 1 – standard PGN pattern  "N. white [black]"
+        # ----------------------------------------------------------------
+        pgn_pattern = (
+            r'(\d+)\.+\s*'
+            r'(' + san_token + r')'
+            r'(?:\s+(' + san_token + r'))?'
+        )
+        pgn_orphan = r'(\d+)\.{2,3}\s*(' + san_token + r')'
+
+        for match in re.finditer(pgn_pattern, text):
+            n = int(match.group(1))
+            wm = self.normalize_move(match.group(2))
+            bm = self.normalize_move(match.group(3)) if match.group(3) else None
+            if wm:
+                move_dict[n] = ChessMove(move_number=n, white_move=wm,
+                                         black_move=bm, confidence=0.9)
+        for match in re.finditer(pgn_orphan, text):
+            n  = int(match.group(1))
+            bm = self.normalize_move(match.group(2))
+            if n in move_dict and move_dict[n].black_move is None:
+                move_dict[n].black_move = bm
+            elif n not in move_dict and bm:
+                move_dict[n] = ChessMove(move_number=n, white_move="?",
+                                         black_move=bm, confidence=0.7)
+
+        # ----------------------------------------------------------------
+        # Pass 2 – scoresheet row parser
+        #   Each OCR "line" may look like:
+        #     "1 d4 d5"             → move 1: white=d4, black=d5
+        #     "1 d4 d5 31 Qd1 Nd7"  → move 1 AND move 31
+        #     "3, Nf3 Rex 33"       → move 3 (Rex=OCR noise) AND empty move 33
+        #   Strategy: tokenise each line; whenever we see a pure number treat
+        #   it as a new move-number and collect up to 2 SAN tokens that follow.
+        # ----------------------------------------------------------------
+        for line in text.splitlines():
+            tokens = line.split()
+            i = 0
+            while i < len(tokens):
+                tok = tokens[i]
+                stripped = tok.rstrip('.,;:')
+                if stripped.isdigit():
+                    move_num = int(stripped)
+                    # Already captured by Pass 1 with high confidence → skip
+                    if move_num in move_dict and move_dict[move_num].white_move != "?":
+                        i += 1
+                        continue
+                    # Collect subsequent SAN tokens
+                    san_tokens: List[str] = []
+                    j = i + 1
+                    while j < len(tokens) and len(san_tokens) < 2:
+                        candidate = self.normalize_move(tokens[j])
+                        if san_re.match(candidate) and candidate:
+                            san_tokens.append(candidate)
+                            j += 1
+                        elif num_re.match(tokens[j]):
+                            break  # next move-number
+                        else:
+                            j += 1  # skip noise
+                    if not san_tokens:
+                        i += 1
+                        continue
+                    wm = san_tokens[0]
+                    bm = san_tokens[1] if len(san_tokens) > 1 else None
+                    existing = move_dict.get(move_num)
+                    if existing is None:
+                        move_dict[move_num] = ChessMove(
+                            move_number=move_num,
+                            white_move=wm, black_move=bm, confidence=0.75
+                        )
+                    else:
+                        # Fill in missing black move
+                        if existing.black_move is None and bm:
+                            existing.black_move = bm
+                    i = j
+                else:
+                    i += 1
+
+        # ----------------------------------------------------------------
+        # Filter out empty / header moves and sort
+        # ----------------------------------------------------------------
+        valid = {n: m for n, m in move_dict.items()
+                 if m.white_move and m.white_move not in ("-", "?")}
+        moves = [valid[k] for k in sorted(valid)]
+
         print(f"  Parsed {len(moves)} move pairs")
+        if moves:
+            for m in moves[:5]:
+                bstr = f" {m.black_move}" if m.black_move else ""
+                print(f"    {m.move_number}. {m.white_move}{bstr}")
+            if len(moves) > 5:
+                print(f"    ... ({len(moves) - 5} more)")
         return moves
+
     
     def validate_move(self, move: str, position: Optional[str] = None) -> bool:
         """
@@ -351,30 +666,80 @@ class NotationParser:
     
     def normalize_move(self, move: str) -> str:
         """
-        Normalize a move to standard algebraic notation
-        
+        Normalize a handwritten/OCR'd move to standard algebraic notation.
+
+        Handles common handwriting OCR confusions:
+        - 'Q' written like 'q' or '0'
+        - 'x' written with various symbols
+        - castling variants (O-O, 0-0, etc.)
+        - spaces within a token (e.g. "e 4" → "e4")
+        - stray punctuation
+
         Args:
-            move: Move string in any supported format
-            
+            move: Move string from OCR
+
         Returns:
-            Normalized move string
+            Normalized move string in SAN format
         """
-        # Remove extra whitespace
+        # Remove leading/trailing whitespace and stray periods
         move = move.strip()
-        
-        # Remove common OCR errors
-        move = move.replace('O', '0')  # Sometimes O is misread as 0
-        move = move.replace('o', '0')
-        
-        # Handle castling notation
-        if move in ['0-0', '00', 'O-O']:
-            move = 'O-O'
-        elif move in ['0-0-0', '000', 'O-O-O']:
-            move = 'O-O-O'
-        
-        # Remove periods that might have been captured
-        move = move.replace('.', '')
-        
+
+        # Remove internal spaces (e.g. "e 4" → "e4", "N f3" → "Nf3")
+        move = re.sub(r'(?<=[a-zA-Z])\s+(?=[a-h1-8xX])', '', move)
+        move = re.sub(r'(?<=[a-h])\s+(?=[1-8])', '', move)
+
+        # Remove stray delimiter characters at start/end
+        move = move.strip('.,;:()')
+
+        # --- Handle castling FIRST (before any substitution) ---
+        castling_queenside = {'O-O-O','0-0-0','OOO','000','o-o-o','ooo',
+                               'O-0-O','0-O-0','O-O-0','0-0-O'}
+        castling_kingside  = {'O-O','0-0','OO','00','o-o','oo',
+                               'O-0','0-O'}
+        # Also handle written as "O - O - O" with spaces
+        compact = move.replace(' ', '').replace('-', '')
+        if compact.upper() in {'OOO','000'}:
+            return 'O-O-O'
+        if compact.upper() in {'OO','00'}:
+            return 'O-O'
+        if move in castling_queenside:
+            return 'O-O-O'
+        if move in castling_kingside:
+            return 'O-O'
+
+        # --- Common handwriting OCR character fixes ---
+
+        # Piece letters: uppercase them
+        # 'q' at start → 'Q'  (queen often written lowercase)
+        move = re.sub(r'^q', 'Q', move)
+        # 'b' at start followed by a file letter → likely 'B' (bishop)
+        move = re.sub(r'^b(?=[a-hA-H1-8x])', 'B', move)
+        # 'r' at start → 'R'
+        move = re.sub(r'^r(?=[a-hA-H1-8x])', 'R', move)
+        # 'n' at start → 'N'
+        move = re.sub(r'^n(?=[a-hA-H1-8x])', 'N', move)
+        # 'k' at start → 'K'
+        move = re.sub(r'^k(?=[a-hA-H1-8x])', 'K', move)
+
+        # Capture symbol: normalize various OCR variants of 'x'
+        move = re.sub(r'[Xx*×✕]', 'x', move)
+
+        # Rank digits: '0' (zero) appearing as rank after a file letter
+        move = re.sub(r'([a-hA-H])0', lambda m: m.group(1) + 'o', move)
+        # Actually we want the opposite: 'o' after a file → digit confusion
+        # e.g. "eo" probably means "e0"?  Ranks are 1-8, not 0. Leave alone.
+
+        # Lowercase file letters (they should be lowercase already)
+        # Piece letter capitalisation check: [KQRBN] then file+rank
+        move = re.sub(r'^([kqrbn])([a-h][1-8])', 
+                      lambda m: m.group(1).upper() + m.group(2), move)
+
+        # Check/checkmate markers: keep as-is (+, #)
+        # Promotion: '=' should stay (e.g. e8=Q)
+
+        # Remove any remaining stray non-chess characters but keep +#=x
+        move = re.sub(r'[^a-zA-Z0-9+#=x\-]', '', move)
+
         return move
 
 
