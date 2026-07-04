@@ -259,3 +259,18 @@ if uploaded:
 
 else:
     st.info("👆 Upload a score sheet image above to get started.")
+
+
+# ── Credits ────────────────────────────────────────────────────────────────
+st.divider()
+st.markdown(
+    """
+    <div style="text-align: center; padding: 1rem 0 0.5rem 0; opacity: 0.7;">
+        <p style="margin: 0; font-size: 0.85rem;">Created by</p>
+        <p style="margin: 0.25rem 0 0 0; font-size: 1rem; font-weight: 600;">
+            Abhyuday Khodpe & Anirban Goswami
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
