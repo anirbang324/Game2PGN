@@ -21,7 +21,9 @@ MEDIA_TYPE_MAP = {
     "webp": "image/webp",
 }
 
-EXTRACT_PROMPT = """You are a chess notation expert. Carefully analyse this handwritten chess score sheet image and extract every move.
+EXTRACT_PROMPT = """You are a chess notation expert. Carefully analyse this handwritten chess score sheet image and extract EVERY single move written on it.
+
+IMPORTANT: Read ALL rows on the score sheet from the very first row to the very last row. Do NOT stop early. Chess score sheets often have 30+ rows — you must read every row that has a move written in it, even if the handwriting is difficult.
 
 Return ONLY a valid JSON object — no markdown, no extra text — in exactly this shape:
 {
@@ -35,9 +37,11 @@ Return ONLY a valid JSON object — no markdown, no extra text — in exactly th
 
 Rules:
 - `moves` must alternate White / Black in Standard Algebraic Notation (SAN).
-- If a move is illegible, use the string "?" as a placeholder.
+- If a move is illegible, use the string "?" as a placeholder — but keep reading subsequent rows.
 - Do NOT add move numbers, dots, or annotations into the moves array.
-- Extract only what is visibly written; never invent moves."""
+- Do NOT include the game result (1-0, 0-1, 1/2-1/2, *) in the moves array — put it in the "result" field only.
+- Extract only what is visibly written; never invent moves.
+- Read EVERY row from top to bottom. Do not skip any row."""
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 
@@ -103,27 +107,89 @@ def build_pgn(game_data: dict) -> tuple:
     game.headers["Date"]   = game_data.get("date")         or date.today().strftime("%Y.%m.%d")
     game.headers["White"]  = game_data.get("white_player") or "?"
     game.headers["Black"]  = game_data.get("black_player") or "?"
-    game.headers["Result"] = game_data.get("result")       or "*"
+    result = game_data.get("result") or "*"
+    game.headers["Result"] = result
 
     board  = game.board()
     node   = game
     errors = []
+    moves  = game_data.get("moves", [])
+    validated = 0                       # count of half-moves validated
 
-    for idx, san in enumerate(game_data.get("moves", []), start=1):
+    for idx, san in enumerate(moves, start=1):
         if san == "?":
-            errors.append(f"Move {idx}: illegible — stopped here")
+            errors.append(f"Move {idx}: illegible")
             break
         try:
             move = board.parse_san(san)
             node = node.add_variation(move)
             board.push(move)
+            validated += 1
         except Exception as exc:
             errors.append(f"Move {idx} ({san}): {exc}")
             break
 
+    # Build PGN from the validated portion
     buf = io.StringIO()
     print(game, file=buf, end="\n")
-    return buf.getvalue(), errors
+    pgn_raw = buf.getvalue()
+
+    # Append any remaining unvalidated moves as raw PGN text
+    remaining = moves[validated:]
+    if remaining:
+        # Strip the trailing result from the validated PGN so we can append moves
+        pgn_raw = pgn_raw.rstrip()
+        if pgn_raw.endswith(result):
+            pgn_raw = pgn_raw[: -len(result)].rstrip()
+
+        for i, san in enumerate(remaining):
+            half = validated + i          # 0-indexed half-move number
+            if half % 2 == 0:             # White's move
+                move_num = half // 2 + 1
+                pgn_raw += f" {move_num}. {san}"
+            else:                         # Black's move
+                pgn_raw += f" {san}"
+
+        pgn_raw += f" {result}\n"
+
+    # Reformat: put each move pair on its own line for easier editing
+    pgn_raw = _reformat_pgn_moves(pgn_raw)
+    return pgn_raw, errors
+
+
+def _reformat_pgn_moves(pgn_text: str) -> str:
+    """Rewrite the move-text section so each numbered move starts on a new line."""
+    lines = pgn_text.split("\n")
+    header_lines = []
+    move_text = ""
+    in_moves = False
+    for line in lines:
+        if not in_moves:
+            header_lines.append(line)
+            # Moves start after the last header (blank line after [headers])
+            if line == "" and header_lines and any(l.startswith("[") for l in header_lines):
+                in_moves = True
+        else:
+            move_text += " " + line
+    move_text = move_text.strip()
+    if not move_text:
+        return pgn_text
+    # Split on move numbers:  "1." "2." etc.
+    parts = re.split(r'(\d+\.)', move_text)
+    formatted_moves = []
+    i = 0
+    while i < len(parts):
+        part = parts[i].strip()
+        if re.match(r'\d+\.$', part):
+            # Combine move number with the following moves
+            rest = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            formatted_moves.append(f"{part} {rest}")
+            i += 2
+        else:
+            if part:
+                formatted_moves.append(part)
+            i += 1
+    return "\n".join(header_lines) + "\n".join(formatted_moves) + "\n"
 
 
 def build_csv(game_data: dict) -> str:
@@ -159,8 +225,9 @@ st.set_page_config(
 
 st.title("♟️ Chess Notation Converter")
 st.markdown(
-    "Upload a **photo of a handwritten chess score sheet** and get instant "
-    "**PGN** and **CSV** exports — powered by Google Gemini (free)."
+    "Upload **one or more photos** of a handwritten chess score sheet and get instant "
+    "**PGN** and **CSV** exports — powered by Google Gemini (free).  \n"
+    "*Multi-page score sheets? Upload all pages in order.*"
 )
 st.divider()
 
@@ -194,37 +261,87 @@ with st.sidebar:
         selected_model = st.selectbox("Model", models, index=default_idx)
         st.caption(f"Using `{selected_model}` · Free tier · No credit card needed")
 
-# ── File uploader ──────────────────────────────────────────────────────────
-uploaded = st.file_uploader(
-    "📷 Drop your score sheet here",
+# ── File uploader (multi-image) ────────────────────────────────────────────
+uploaded_files = st.file_uploader(
+    "📷 Drop your score sheet(s) here",
     type=["jpg", "jpeg", "png", "webp"],
-    help="Works with photos, scans, or any clear image of a score sheet.",
+    accept_multiple_files=True,
+    help="Upload one or more images. For multi-page sheets, upload all pages in order.",
 )
 
-if uploaded:
-    st.image(uploaded, caption="Uploaded score sheet", use_column_width=True)
+if uploaded_files:
+    # Show thumbnails in a grid
+    cols = st.columns(min(len(uploaded_files), 4))
+    for i, f in enumerate(uploaded_files):
+        cols[i % len(cols)].image(f, caption=f"Page {i + 1}: {f.name}", use_container_width=True)
     st.divider()
 
-    if st.button("🔍 Extract & Convert", type="primary", use_container_width=True):
+    n = len(uploaded_files)
+    label = f"🔍 Extract & Convert ({n} image{'s' if n > 1 else ''})"
+    if st.button(label, type="primary", use_container_width=True):
 
         if not api_key:
             st.error("❌ Please enter your Gemini API key in the sidebar first.")
             st.stop()
 
-        with st.spinner(f"Reading handwriting with `{selected_model}`…"):
+        # ── Process each image sequentially ───────────────────────────
+        all_moves = []
+        metadata = {}          # take metadata from first image
+        progress = st.progress(0, text="Starting extraction…")
+
+        for idx, file in enumerate(uploaded_files):
+            page_label = f"Page {idx + 1}/{n}: {file.name}"
+            progress.progress((idx) / n, text=f"Reading {page_label}…")
+
             try:
-                image_bytes = uploaded.read()
-                ext         = uploaded.name.rsplit(".", 1)[-1].lower()
+                image_bytes = file.read()
+                ext         = file.name.rsplit(".", 1)[-1].lower()
                 media_type  = MEDIA_TYPE_MAP.get(ext, "image/jpeg")
-                game_data   = extract_moves(image_bytes, media_type, api_key, selected_model)
+                page_data   = extract_moves(image_bytes, media_type, api_key, selected_model)
             except json.JSONDecodeError:
-                st.error("❌ Could not parse the notation. Try a clearer / higher-resolution photo.")
+                st.error(f"❌ Could not parse notation from {page_label}. Try a clearer photo.")
                 st.stop()
             except Exception as exc:
-                st.error(f"❌ Extraction failed: {exc}")
+                st.error(f"❌ Extraction failed for {page_label}: {exc}")
                 st.stop()
 
-        st.success("✅ Notation extracted!")
+            # Keep metadata from the first image only
+            if idx == 0:
+                metadata = {
+                    "white_player": page_data.get("white_player"),
+                    "black_player": page_data.get("black_player"),
+                    "event":        page_data.get("event"),
+                    "date":         page_data.get("date"),
+                    "result":       page_data.get("result"),
+                }
+
+            page_moves = page_data.get("moves", [])
+            all_moves.extend(page_moves)
+            st.toast(f"✅ {page_label} — {len(page_moves)} half-moves")
+
+        progress.progress(1.0, text="Done!")
+
+        # Combine into one game_data dict and persist in session state
+        game_data = {**metadata, "moves": all_moves}
+        pgn_str, pgn_errors = build_pgn(game_data)
+        csv_str              = build_csv(game_data)
+
+        st.session_state["game_data"]  = game_data
+        st.session_state["pgn_str"]    = pgn_str
+        st.session_state["pgn_editor"] = pgn_str   # seed the editor widget
+        st.session_state["csv_str"]    = csv_str
+        st.session_state["pgn_errors"] = pgn_errors
+        st.session_state["num_images"] = n
+
+    # ── Show results if available in session state ─────────────────────
+    if "game_data" in st.session_state:
+        game_data  = st.session_state["game_data"]
+        pgn_str    = st.session_state["pgn_str"]
+        csv_str    = st.session_state["csv_str"]
+        pgn_errors = st.session_state["pgn_errors"]
+        n_imgs     = st.session_state["num_images"]
+
+        st.success(f"✅ Notation extracted from {n_imgs} image{'s' if n_imgs > 1 else ''}!")
 
         # Game metadata
         with st.expander("📋 Extracted game info", expanded=True):
@@ -235,42 +352,31 @@ if uploaded:
             c2.metric("Result", game_data.get("result")       or "—")
             moves = game_data.get("moves", [])
             st.write(f"**{len(moves)} half-moves ({len(moves)//2 + len(moves)%2} full moves) detected**")
+            if n_imgs > 1:
+                st.caption(f"Merged from {n_imgs} images")
             st.code(format_moves_display(moves), language="text")
-
-        pgn_str, pgn_errors = build_pgn(game_data)
-        csv_str             = build_csv(game_data)
 
         if pgn_errors:
             st.warning("⚠️ Some moves couldn't be validated:\n- " + "\n- ".join(pgn_errors))
 
-        # Downloads
+        # Editable PGN
+        st.subheader("✏️ Edit PGN")
+        st.caption("Review and edit the generated PGN before downloading.")
+        # Auto-size: ~28px per line, min 150 — no max so all rows are visible
+        line_count = pgn_str.count("\n") + 1
+        area_height = max(line_count * 28, 150)
+        edited_pgn = st.text_area(
+            "PGN content",
+            height=area_height,
+            key="pgn_editor",
+            label_visibility="collapsed",
+        )
+
+        # Downloads — uses edited PGN
         st.subheader("📥 Download")
         dl1, dl2 = st.columns(2)
-        dl1.download_button("⬇️ Download PGN", pgn_str, "game.pgn", "text/plain",  use_container_width=True)
+        dl1.download_button("⬇️ Download PGN", edited_pgn, "game.pgn", "text/plain",  use_container_width=True)
         dl2.download_button("⬇️ Download CSV", csv_str, "game.csv", "text/csv",    use_container_width=True)
-
-        # Previews
-        st.subheader("👁️ Preview")
-        tab_pgn, tab_csv = st.tabs(["PGN", "CSV"])
-        with tab_pgn:
-            st.code(pgn_str, language="text")
-        with tab_csv:
-            st.code(csv_str, language="text")
 
 else:
     st.info("👆 Upload a score sheet image above to get started.")
-
-
-# ── Credits ────────────────────────────────────────────────────────────────
-st.divider()
-st.markdown(
-    """
-    <div style="text-align: center; padding: 1rem 0 0.5rem 0; opacity: 0.7;">
-        <p style="margin: 0; font-size: 0.85rem;">Created by</p>
-        <p style="margin: 0.25rem 0 0 0; font-size: 1rem; font-weight: 600;">
-            Abhyuday Khodpe & Anirban Goswami
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
