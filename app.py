@@ -532,6 +532,10 @@ st.set_page_config(
 st.markdown("""
     <style>
         div[data-testid="InputInstructions"] { display: none; }
+        /* Ensure all selectbox dropdown options are visible (fixes clipped last item) */
+        div[data-baseweb="popover"] ul {
+            max-height: 400px !important;
+        }
     </style>
 """, unsafe_allow_html=True)
 
