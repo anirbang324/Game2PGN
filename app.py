@@ -532,8 +532,20 @@ st.set_page_config(
 st.markdown("""
     <style>
         div[data-testid="InputInstructions"] { display: none; }
-        /* Ensure all selectbox dropdown options are visible (fixes clipped last item) */
-        div[data-baseweb="popover"] ul {
+        /* Fix: selectbox dropdown clipped in sidebar tabs */
+        [data-testid="stSidebar"] [role="tabpanel"] {
+            overflow: visible !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {
+            overflow: visible !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+            overflow: visible !important;
+        }
+        div[data-baseweb="popover"] {
+            overflow: visible !important;
+        }
+        ul[role="listbox"] {
             max-height: 400px !important;
         }
     </style>
